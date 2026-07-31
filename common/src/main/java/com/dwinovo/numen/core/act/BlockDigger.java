@@ -29,8 +29,10 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  *   <li>each tick: accumulate the block's real {@link BlockState#getDestroyProgress}
  *       and broadcast the crack overlay (breaker id {@code -1} — the
  *       server does NOT self-complete a survival break for a fake player);</li>
- *   <li>finish: {@code handleBlockBreakAction(STOP_DESTROY_BLOCK)} → the SERVER
- *       destroys the block (drops / durability / events). We do NOT clear the
+ *   <li>finish: {@code ServerPlayerGameMode.destroyBlock} commits the break on
+ *       the server (drops / durability / events). A fake player has no client
+ *       controller continuously synchronising destroy progress, so STOP alone
+ *       is not a reliable completion signal. We do NOT clear the
  *       crack — the block vanishing removes it, so there's no "intact for one
  *       frame" flicker — and we set a {@code blockHitDelay} so the next dig waits
  *       for the destroy to land instead of re-starting the same block;</li>
@@ -67,6 +69,12 @@ public final class BlockDigger {
     /** The block currently being dug, or {@code null} when idle. */
     public BlockPos current() {
         return pos;
+    }
+
+    /** Whether at least one point on {@code target}'s outline can be hit from
+     * the player's current eye position and configured block reach. */
+    public boolean canReach(BlockPos target) {
+        return reachableHit(target) != null;
     }
 
     /** Outcome of one {@link #digStep} tick — lets callers distinguish "still working"
@@ -218,13 +226,22 @@ public final class BlockDigger {
         level.destroyBlockProgress(CRACK_ID, pos, stage);
         player.swing(InteractionHand.MAIN_HAND);
         if (progress >= 1.0f) {
-            // STOP → server destroys. Do NOT clear the crack: the block vanishing
-            // removes it (no intact-for-a-frame flicker).
-            player.gameMode.handleBlockBreakAction(pos,
-                    ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK, side, level.getMaxY(), -1);
-            blockHitDelay = postBreakDelay();
-            reset();
-            return targetBreak ? DigResult.BROKE_TARGET : DigResult.BROKE_OCCLUDER;
+            // The fake player has no client controller to keep the server's
+            // destroy-progress state in lockstep with this loop. Commit through
+            // the native server method after the real BlockState timing has elapsed;
+            // this still runs permissions, events, drops, durability and exhaustion.
+            boolean destroyed = player.gameMode.destroyBlock(pos);
+            if (destroyed || level.getBlockState(pos).isAir()) {
+                blockHitDelay = postBreakDelay();
+                reset();
+                return targetBreak ? DigResult.BROKE_TARGET : DigResult.BROKE_OCCLUDER;
+            }
+
+            // A protection/mod hook rejected the break. Abort the stale native
+            // START state and retry from a clean state instead of falsely reporting
+            // success and removing the target from the mining task.
+            start(pos, false);
+            return DigResult.NO_SHOT;
         }
         return DigResult.PROGRESSING;
     }

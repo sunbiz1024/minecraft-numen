@@ -22,12 +22,9 @@ import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.phys.BlockHitResult;
-import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
@@ -78,7 +75,6 @@ public final class MineCompanionTask extends AbstractCompanionTask<MineBlockTask
     private static final int SCAN_Y_THRESHOLD = 10;
     /** 已凑够但全在层外时,最远还愿意扫出去的 chunk 环半径。 */
     private static final int SCAN_MAX_CHUNK_RADIUS = 32;
-    private static final double REACH_SQR = 4.5 * 4.5;
     private static final double MINE_SPEED = 1.0;
     /** Give up branch-mining after this many ticks with no ore found (~30 s). */
     private static final int MAX_BRANCH_TICKS = 600;
@@ -200,7 +196,7 @@ public final class MineCompanionTask extends AbstractCompanionTask<MineBlockTask
         //    until it breaks or drifts out of reach.
         BlockPos digging = digger.current();
         if (digging != null) {
-            if (level.getBlockState(digging).isAir() || !withinReach(digging)) {
+            if (level.getBlockState(digging).isAir() || !digger.canReach(digging)) {
                 digger.cancel();
             } else {
                 mineProgress(digging);
@@ -422,40 +418,28 @@ public final class MineCompanionTask extends AbstractCompanionTask<MineBlockTask
     }
 
     /**
-     * The "shaft" test: a known target in the body's OWN feet column (x/z match),
-     * at or above feet, still solid, and reachable (within reach distance AND with
-     * a clear sight line). Mined in place, no pathing. The A* stance goal is what
-     * gets the body INTO the column; this only fires once it's there. No
-     * reach-from-the-side shortcut.
+     * Pick the nearest known target that can be reached by a real block interaction
+     * from the current eye position. Baritone pauses pathing whenever its rotation
+     * resolver can reach an ore; requiring the feet to share the ore's X/Z column
+     * rejects ordinary side-on mining and can repeatedly satisfy then blacklist a
+     * perfectly usable stance.
      */
     private BlockPos reachableTarget() {
         if (!player.onGround()) return null;
         Level level = player.level();
-        BlockPos feet = player.blockPosition();
         Vec3 eyes = player.getEyePosition();
         BlockPos best = null;
         double bestD = Double.MAX_VALUE;
         for (BlockPos ore : knownOres) {
-            if (ore.getX() != feet.getX() || ore.getZ() != feet.getZ()) continue;   // same column
-            if (ore.getY() < feet.getY()) continue;                                  // at or above feet
             if (level.getBlockState(ore).isAir()) continue;
-            if (!withinReach(ore) || !hasLineOfSight(eyes, ore)) continue;           // reachable
-            double d = ore.distSqr(feet.above());
+            if (!digger.canReach(ore)) continue;
+            double d = Vec3.atCenterOf(ore).distanceToSqr(eyes);
             if (d < bestD) {
                 bestD = d;
                 best = ore;
             }
         }
         return best;
-    }
-
-    /** Clear sight line from the eyes to the target block's centre (nothing solid
-     *  blocks it but the target itself). */
-    private boolean hasLineOfSight(Vec3 eyes, BlockPos target) {
-        BlockHitResult hit = player.level().clip(new ClipContext(
-                eyes, Vec3.atCenterOf(target),
-                ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player));
-        return hit.getType() == HitResult.Type.MISS || hit.getBlockPos().equals(target);
     }
 
     // ---- mining (progressive, tick-by-tick like a real player) ----
@@ -679,10 +663,6 @@ public final class MineCompanionTask extends AbstractCompanionTask<MineBlockTask
                     FailureType.MINED_OUT);
         }
         return TaskState.FAILED;
-    }
-
-    private boolean withinReach(BlockPos pos) {
-        return player.distanceToSqr(Vec3.atCenterOf(pos)) <= REACH_SQR;
     }
 
     /** Stop the nav AND clear the branch-mode flag (extends the base's nav release). */
