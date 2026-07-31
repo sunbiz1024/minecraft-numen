@@ -94,10 +94,14 @@ public final class MineCompanionTask extends AbstractCompanionTask<MineBlockTask
      *  COLLIDER ray disagreement, a lip over the stance). Without this the dig could
      *  grind forever waiting for a shot that never comes. */
     private static final int MAX_NO_SHOT_TICKS = 20;
-    /** How long a just-broken target's cell stays a walk-over goal (ticks) — the drop
-     *  takes a moment to spawn, and without this window the body sprints for the next
-     *  ore before the item pops and leaves it behind. */
-    private static final int DROP_LOITER_TICKS = 5;
+    /** Keep a broken target as a return-to-loot waypoint for the vanilla item
+     *  lifetime. Survival reflexes can drag the body far away for much longer than
+     *  the old five-tick spawn grace; expiring the waypoint while suspended made
+     *  the resumed mining task forget its drops permanently. */
+    private static final int DROP_RETURN_TICKS = 20 * 60 * 5;
+    /** Do not clear a return waypoint until the drop has had time to spawn. */
+    private static final int DROP_SPAWN_GRACE_TICKS = 10;
+    private static final double DROP_COLLECT_REACHED_SQR = 2.25;
 
     private final List<BlockPos> knownOres = new ArrayList<>();
     private final Set<BlockPos> blacklist = new HashSet<>();
@@ -117,6 +121,7 @@ public final class MineCompanionTask extends AbstractCompanionTask<MineBlockTask
     private final Map<BlockPos, Long> anticipatedDrops = new HashMap<>();
 
     private boolean navIsBranch;
+    private boolean navTargetsDrops;
     private BlockPos branchPoint;
     private int branchY;
     private int rescanTimer;
@@ -224,7 +229,8 @@ public final class MineCompanionTask extends AbstractCompanionTask<MineBlockTask
         //    shaft opens up; drops are collected by walking over them (native pickup).
         if (!knownOres.isEmpty() || !drops.isEmpty()) {
             branchTicks = 0;
-            if (nav == null || navIsBranch) {
+            boolean shouldTargetDrops = !drops.isEmpty();
+            if (nav == null || navIsBranch || navTargetsDrops != shouldTargetDrops) {
                 stopNav();
                 // Compiled front door: every known ore is SACRED — the route gets the
                 // body to the ore; digging it is THIS task's job (with this task's
@@ -233,6 +239,7 @@ public final class MineCompanionTask extends AbstractCompanionTask<MineBlockTask
                         () -> reachableTarget() != null);
                 nav.setHighlights(() -> new ArrayList<>(knownOres));   // box every known target
                 navIsBranch = false;
+                navTargetsDrops = shouldTargetDrops;
             }
             switch (nav.tick()) {
                 case RUNNING -> { return TaskState.RUNNING; }
@@ -309,12 +316,16 @@ public final class MineCompanionTask extends AbstractCompanionTask<MineBlockTask
     // ---- goals ----
 
     /** The whole mining objective, compiled: a stance per ore + a walk-over member
-     *  per nearby drop, with every ore cell sacred — one A* search heads for the
-     *  closest of either, and the route can't consume a target on the way. */
+     *  per nearby drop, with every ore cell sacred. Pending drops take priority:
+     *  after combat/flee preemption the body returns to its old loot before choosing
+     *  another nearby ore and drifting still farther away. */
     private GoalCompiler.Compiled oreFieldCompiled() {
         if (knownOres.isEmpty() && drops.isEmpty()) {
             // Degenerate frame (targets vanished between ticks): stand where we are.
             return GoalCompiler.standOn(player.blockPosition());
+        }
+        if (!drops.isEmpty()) {
+            return GoalCompiler.mineField(List.of(), new ArrayList<>(drops));
         }
         CalculationContext ctx = ContextFactory.forExecution(player);
         List<GoalCompiler.Stance> stances =
@@ -389,7 +400,8 @@ public final class MineCompanionTask extends AbstractCompanionTask<MineBlockTask
      *  targets actually drop (a stray rotten flesh isn't this task's business), within
      *  the task's own working radius. A drop sitting next to a known ore is skipped —
      *  mining that ore walks us there anyway. Just-broken cells linger as members for
-     *  {@link #DROP_LOITER_TICKS} so the spawning drop isn't left behind. */
+     *  {@link #DROP_RETURN_TICKS} so combat/flee preemption cannot make the task
+     *  forget where its freshly mined items were left. */
     private List<BlockPos> droppedItems() {
         Level level = player.level();
         long now = level.getGameTime();
@@ -405,8 +417,16 @@ public final class MineCompanionTask extends AbstractCompanionTask<MineBlockTask
             if (blacklist.contains(p) || nearKnownOre(p)) continue;
             out.add(p);
         }
+        // Once the body has returned after the spawn grace, walking over the
+        // location has fulfilled this waypoint. Native pickup (if the item still
+        // exists) happens independently during the entity tick.
+        anticipatedDrops.entrySet().removeIf(e -> {
+            long created = e.getValue() - DROP_RETURN_TICKS;
+            return now >= created + DROP_SPAWN_GRACE_TICKS
+                    && player.distanceToSqr(Vec3.atCenterOf(e.getKey())) <= DROP_COLLECT_REACHED_SQR;
+        });
         for (BlockPos p : anticipatedDrops.keySet()) {
-            if (blacklist.contains(p) || nearKnownOre(p)) continue;
+            if (blacklist.contains(p)) continue;
             out.add(p);
         }
         return out;
@@ -459,7 +479,7 @@ public final class MineCompanionTask extends AbstractCompanionTask<MineBlockTask
             case BROKE_TARGET -> {
                 knownOres.remove(pos);
                 anticipatedDrops.put(pos.immutable(),
-                        player.level().getGameTime() + DROP_LOITER_TICKS);
+                        player.level().getGameTime() + DROP_RETURN_TICKS);
                 clearNoShot();
             }
             case NO_SHOT -> {
@@ -670,6 +690,7 @@ public final class MineCompanionTask extends AbstractCompanionTask<MineBlockTask
     protected void stopNav() {
         super.stopNav();
         navIsBranch = false;
+        navTargetsDrops = false;
     }
 
     @Override
